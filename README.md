@@ -1,99 +1,132 @@
+
 # AI Webhook Ingestion Service
 
-A backend service that ingests arbitrary vendor webhook JSON payloads, classifies the event (Shipment / Invoice / Unclassified) using LLMs, normalizes the data to canonical internal schemas, and persists the result for downstream systems.
+A backend service that ingests arbitrary vendor webhooks, classifies them (Shipment / Invoice / Unclassified), normalizes them into a standard schema using an LLM, and stores the results.
 
-This repository contains a reference implementation and an architecture-first design to handle noisy, duplicate, and out-of-order webhooks from many vendors.
+---
 
-Goals
-- Accept any JSON webhook and acknowlege quickly (sub-second)
-- Use an LLM to classify and normalize vendor payloads into canonical schemas
-- Be resilient to duplicate payloads and out-of-order event arrival
-- Preserve an append-only audit trail for every inbound webhook
+## Goals
 
-Contents
-- `src/` - application source code (API, worker, normalization pipeline)
-- `docs/ARCHITECTURE.md` - system architecture and design decisions
-- `prompts/` - canonical LLM prompt templates and examples
-- `schemas/` - JSON Schema definitions for normalized objects
-- `samples/` - sample vendor payloads and Postman/Insomnia collections
-- `tasks.md` - project backlog and GitHub-issues-ready tasks
-- `docker-compose.yml` - development compose file (if present)
+* Accept any JSON webhook and respond quickly (<200ms)
+* Normalize messy vendor data into a clean internal format
+* Handle duplicate and out-of-order events
+* Maintain an append-only audit log
 
-Quickstart (local, without Docker)
-1. Ensure you have Python 3.10+ (or preferred runtime), virtualenv/poetry, Postgres, and Redis available.
-2. Create virtual environment and install dependencies (example using poetry):
+---
 
-   ```bash
-   poetry install
-   ```
+## Architecture (High Level)
 
-3. Configure environment variables (see Configuration below). Run migrations and start services:
+1. **Ingestion API**
 
-   ```bash
-   # run DB migrations (example)
-   alembic upgrade head
+   * Accepts webhook (`POST /webhook`)
+   * Stores raw payload
+   * Enqueues processing job
 
-   # start app (example using uvicorn)
-   uvicorn src.app.main:app --reload --host 0.0.0.0 --port 8000
+2. **Worker**
 
-   # start worker
-   python -m src.worker
-   ```
+   * Classifies event using LLM
+   * Normalizes payload into canonical schema
+   * Stores normalized event
 
-Configuration (recommended env vars)
-- `DATABASE_URL` - Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/webhooks`)
-- `REDIS_URL` - Redis connection string for queue/locks
-- `LLM_PROVIDER` - Identifier of LLM provider (`openai`, `anthropic`, etc.)
-- `OPENAI_API_KEY` - API key for OpenAI (if used)
-- `QUEUE_TYPE` - `redis` or `sqla` (Postgres-backed queue)
-- `LOG_LEVEL` - `INFO` / `DEBUG`
-- `HMAC_SECRETS` - (optional) per-vendor HMAC secrets mapping for signature verification
+3. **Storage**
 
-Endpoints
-- `POST /webhooks` - Accepts arbitrary JSON payloads. Returns a `receipt_id` and immediate acknowledgement. Example response:
+   * Raw events (append-only)
+   * Normalized events
+   * Optional derived state (latest status per entity)
 
-  ```json
-  {"status": "accepted", "receipt_id": "raw_01F..."}
-  ```
+---
 
-High-level workflow
-1. Ingest: `POST /webhooks` receives JSON; we persist the raw payload to an append-only `raw_payloads` table and enqueue a processing job.
-2. Processing (worker): Job loads raw payload, optionally applies vendor fast-path rules, otherwise calls the LLM wrapper to classify and normalize into a strict JSON Schema.
-3. Persistence: Normalized object is validated and inserted into `normalized_events`. The `entities` table stores the current computed state for that shipment/invoice. All updates append to `event_history` for auditability.
+## Quickstart (using uv)
 
-Operational considerations
-- Sub-second ack: The endpoint returns quickly after ensuring a durable write or enqueue.
-- Deduplication: Use `vendor_event_id` when present, otherwise `payload_hash` and heuristics. Cache LLM results for duplicate suppression.
-- Out-of-order events: `occurred_at` is used to order events; the state machine recomputes `entities.current_state` deterministically when earlier events arrive.
-- Concurrency control: Use per-entity locks (DB advisory locks or Redis locks) when mutating entity state.
-- Retries & DLQ: Worker retries transient failures and pushes to a dead-letter queue after exhausting retries.
+### 1. Install dependencies
 
-Testing
-- Unit tests: `pytest` (core logic and state machine)
-- Integration: a lightweight test harness spins up a mock LLM and local Postgres/Redis to run E2E flows
-- Load testing: recommended tools `k6` or `locust` for webhook burst simulations
+```bash
+uv sync
+```
 
-Prompts & LLM
-- Prompts live in `prompts/` and must instruct the model to output strict JSON that conforms to the `schemas/` definitions.
-- Use explicit examples and ask the model to include a `confidence` field and a `canonical_state` value when applicable.
+---
 
-Developer tools
-- `scripts/replay_raw.py` - replay raw payloads for reprocessing (by id or time range)
-- `scripts/vendor_simulator.py` - send Appendix payloads in order/out-of-order/duplicates
+### 2. Set environment variables
 
-Where to find more
-- Architecture decisions: `docs/ARCHITECTURE.md`
-- Project backlog/tasks: `tasks.md`
+```bash
+export DATABASE_URL=postgresql://user:pass@localhost:5432/webhooks
+export REDIS_URL=redis://localhost:6379/0
+export LLM_PROVIDER=ollama
+```
 
-Roadmap & production readiness
-See `docs/ARCHITECTURE.md` for the roadmap and tradeoffs. Short-term priorities are:
-1. Persistent raw storage + durable queue
-2. Basic LLM wrapper and prompt templates
-3. Deterministic state machine + out-of-order handling
-4. Observability (metrics + traces) and DLQ
+---
 
-Contributing
-Please read `CONTRIBUTING.md` (if present). This project uses GitHub issues (see `tasks.md`) for tasks and prioritization. Create a branch per issue and open PRs against `main`.
+### 3. Run services
 
-License
-MIT
+```bash
+# start API
+uv run uvicorn src.app.main:app --reload
+
+# start worker
+uv run python -m src.worker
+```
+
+---
+
+## API
+
+### POST /webhooks
+
+Accepts any JSON payload.
+
+Response:
+
+```json
+{
+  "status": "accepted",
+  "receipt_id": "..."
+}
+```
+
+---
+
+## Key Design Decisions
+
+* **Async processing** → fast webhook acknowledgment
+* **Append-only storage** → full audit + replay capability
+* **LLM for normalization** → handles unknown vendor formats
+* **Deterministic state** → derived from ordered events
+
+---
+
+## Handling Real-World Issues
+
+* **Duplicates** → hash-based deduplication
+* **Out-of-order events** → ordered by `occurred_at`
+* **LLM failures** → retries + fallback
+* **Invalid JSON from LLM** → safe parsing + repair
+
+---
+
+## LLM Support
+
+The system is **model-agnostic**:
+
+* Local: Ollama (default)
+* Cloud: OpenAI, Gemini, DeepSeek
+
+Prompts enforce:
+
+* strict JSON output
+* canonical status mapping
+* confidence scoring
+
+---
+
+## Future Improvements
+
+* Schema validation + strict enforcement
+* Human-in-the-loop for low-confidence events
+* Streaming pipeline (Kafka)
+* Metrics & tracing (observability)
+
+---
+
+## Summary
+
+This system treats all incoming webhooks as **immutable events** and builds a reliable pipeline that transforms unstructured vendor data into structured, actionable insights.

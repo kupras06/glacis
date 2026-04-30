@@ -3,7 +3,7 @@ import json
 
 from celery_app import celery_app
 from db import SessionLocal, ensure_tables_exist
-from llm import classify, normalize
+from llm import processor
 from models import NormalizedEvent
 
 ensure_tables_exist()
@@ -24,10 +24,10 @@ def process_event(self, payload):
         if existing:
             return "duplicate"
         print(f"Event hash: {event_hash}")
-        classification = classify(payload)
+        classification = processor.classify(payload)
         print(f"Classification: {classification}")
         payload["event_type"] = classification
-        normalized = normalize(payload)
+        normalized = processor.normalize(payload)
         print(f"Normalized: {normalized}")
 
         event = NormalizedEvent(
